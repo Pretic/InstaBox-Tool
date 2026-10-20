@@ -36,6 +36,9 @@ for f in "${FILES[@]}"; do
   if [[ "$f" == *.mjs ]] && command -v node >/dev/null 2>&1; then node --check "$TMP/$f" || die '平台组件检查失败。'; fi
   chmod 700 "$TMP/$f"
 done
+# Prepare image-created parent directories before persisting authorization or
+# taking the installation lock. Only verified existing directories are touched.
+python3 "$TMP/migrate.py" --bundle "$TMP" --ref "$REF" --prepare-only || die '安装目录检查未通过；请按上方提示处理后重新运行同一命令。'
 # Check before migration: creating the new credential directory first would
 # conflict with a real legacy configuration that still needs to be moved.
 FRESH=1
@@ -48,7 +51,7 @@ if [[ -e "$HOME/.config/insta-sing-box" || -L "$HOME/.config/insta-sing-box" ]];
 if (( FRESH )); then
   python3 "$TMP/cloud.py" key ensure || die '首次授权未完成，尚未安装节点；请修正 API Key 后重新运行。'
 fi
-python3 "$TMP/migrate.py" --bundle "$TMP" --ref "$REF" || die '安装或迁移未确认完成；请保留现有目录并按上方提示处理。'
+python3 "$TMP/migrate.py" --bundle "$TMP" --ref "$REF" || die '安装尚未完成；请按上方提示处理后重新运行同一命令。'
 if [[ "$MODE" == install ]]; then
   bash "$CLI/install.sh" install
 fi

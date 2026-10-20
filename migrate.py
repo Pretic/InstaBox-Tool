@@ -8,6 +8,7 @@ changes before applying them. It never calls a cloud API or prints file contents
 """
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -91,6 +92,7 @@ unset TUNNEL_NAME TUNNEL_HELLO_WORLD
 exec "${base}/bin/cloudflared" tunnel --config "${base}/quick-config.yml" --protocol "$protocol" --no-autoupdate --url "http://127.0.0.1:${port}" >> "${base}/quick.log" 2>&1
 '''
 PYTHON_MODULES = frozenset(Path(name).stem for name in FILES if name.endswith(".py"))
+INSTALL_PARENTS = (".local", ".local/share", ".local/bin", ".config", ".config/systemd", ".config/systemd/user")
 
 
 class MigrationError(Exception):
@@ -120,13 +122,13 @@ def owned(path, *, directory=False, private=False, allow_link=False):
     except FileNotFoundError:
         return False
     if info.st_uid != os.getuid():
-        raise MigrationError("安装路径中存在不属于当前用户的文件，未迁移。")
+        raise MigrationError("安装路径不属于当前用户：" + safe_path(path) + "；请使用目录所属用户运行，勿使用 sudo 安装。")
     if stat.S_ISLNK(info.st_mode):
         if allow_link:
             return True
-        raise MigrationError("安装路径包含不允许的符号链接，未迁移。")
+        raise MigrationError("安装路径包含不允许的符号链接：" + safe_path(path) + "；请核对真实路径后重试。")
     if directory != stat.S_ISDIR(info.st_mode) or not directory and not stat.S_ISREG(info.st_mode):
-        raise MigrationError("安装路径类型异常，未迁移。")
+        raise MigrationError("安装路径类型异常：" + safe_path(path) + "；请核对路径后重试。")
     if not directory and info.st_nlink != 1:
         raise MigrationError("安装文件存在额外硬链接，未迁移。")
     if info.st_mode & (0o077 if private else 0o022):
@@ -191,6 +193,107 @@ class Installer:
         if not isinstance(relative, str) or relative.startswith("/") or ".." in Path(relative).parts:
             raise MigrationError("迁移记录中的路径无效，已保留现场。")
         return self.home / relative
+
+    def prepare_parent_directories(self):
+        """Narrowly repair existing user-owned installation parents, never trees.
+
+        Images may pre-create these shared user directories under umask 0000 or
+        0002. Verify every directory before changing any mode, then remove only
+        group/other write bits through anchored descriptors. HOME remains the
+        strictly checked trust anchor. Private application data keeps its normal
+        checks; permissions are not rolled back to an unsafe mode on failure.
+        """
+        if not owned(self.home, directory=True):
+            raise MigrationError("用户目录不存在：" + safe_path(self.home))
+        entries = {}
+
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+        def failure(path, error):
+            reasons = {errno.EROFS: "文件系统只读", errno.EPERM: "系统不允许修改权限",
+                       errno.EACCES: "当前用户权限不足"}
+            reason = reasons.get(error.errno, "目录无法访问或已发生变化")
+            return MigrationError("无法准备安装目录：" + safe_path(path) + "（" + reason + "）；请修正目录权限或挂载设置后重试。")
+
+        def validate(info, path):
+            if stat.S_ISLNK(info.st_mode):
+                raise MigrationError("安装父目录是符号链接：" + safe_path(path) + "；请核对真实路径后重试。")
+            if not stat.S_ISDIR(info.st_mode):
+                raise MigrationError("安装父路径不是目录：" + safe_path(path) + "；请核对路径后重试。")
+            if info.st_uid != os.getuid():
+                raise MigrationError("安装目录不属于当前用户：" + safe_path(path) + "；请使用目录所属用户运行，勿使用 sudo 安装。")
+            if info.st_mode & 0o700 != 0o700:
+                raise MigrationError("当前用户缺少安装目录的读写或进入权限：" + safe_path(path) + "；请恢复所属用户的读写执行权限后重试。")
+
+        def path_info(entry):
+            if entry["parent"] is None:
+                return self.home.lstat()
+            return os.stat(entry["name"], dir_fd=entry["parent"]["fd"], follow_symlinks=False)
+
+        def recheck_all():
+            for entry in entries.values():
+                try:
+                    current = os.fstat(entry["fd"])
+                    linked = path_info(entry)
+                except OSError as error:
+                    raise failure(entry["path"], error) from None
+                if identity(current) != identity(entry["info"]) or identity(linked) != identity(current):
+                    raise MigrationError("安装目录在检查时发生变化：" + safe_path(entry["path"]) + "；已停止，请重新运行安装命令。")
+
+        with contextlib.ExitStack() as stack:
+            for relative in (".", *INSTALL_PARENTS):
+                path = self.home if relative == "." else self.home / relative
+                parent = None if relative == "." else entries.get(str(Path(relative).parent))
+                if relative != "." and parent is None:
+                    continue  # An absent parent also makes this child absent.
+                entry = {"path": path, "parent": parent, "name": Path(relative).name}
+                try:
+                    before = path_info(entry)
+                except FileNotFoundError:
+                    if relative == ".":
+                        raise MigrationError("用户目录不存在：" + safe_path(path)) from None
+                    continue
+                except OSError as error:
+                    raise failure(path, error) from None
+                validate(before, path)
+                try:
+                    fd = os.open(path if parent is None else entry["name"],
+                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                 dir_fd=None if parent is None else parent["fd"])
+                    stack.callback(os.close, fd)
+                    current = os.fstat(fd)
+                except OSError as error:
+                    raise failure(path, error) from None
+                if identity(current) != identity(before):
+                    raise MigrationError("安装目录在打开时发生变化：" + safe_path(path) + "；已停止，请重新运行安装命令。")
+                entries[relative] = {**entry, "fd": fd, "info": current}
+
+            recheck_all()
+            for relative, entry in entries.items():
+                before_mode = stat.S_IMODE(entry["info"].st_mode)
+                mode = before_mode & ~0o022
+                if relative == "." or mode == before_mode:
+                    continue
+                recheck_all()
+                try:
+                    os.fchmod(entry["fd"], mode)
+                    current = os.fstat(entry["fd"])
+                except OSError as error:
+                    raise failure(entry["path"], error) from None
+                expected = identity(entry["info"])[:-1] + (stat.S_IFDIR | mode,)
+                if identity(current) != expected:
+                    raise MigrationError("安装目录权限修改未生效：" + safe_path(entry["path"]) + "；请检查文件系统是否支持权限修改后重试。")
+                entry["info"] = current
+                recheck_all()
+                self.say("已修复安装目录权限：" + safe_path(entry["path"]) + "（" + format(before_mode, "04o") + " → " + format(mode, "04o") + "）。")
+
+    def prepare(self, bundle, ref):
+        if not re.fullmatch(r"[a-f0-9]{40}", ref or ""):
+            raise MigrationError("安装版本标识无效。")
+        self.verify_bundle(Path(bundle).absolute())
+        self.prepare_parent_directories()
+        return 0
 
     def check_parents(self, path):
         if not owned(self.home, directory=True):
@@ -1015,6 +1118,7 @@ exec "$HOME/.local/bin/ibt" "$@"
 
     def install(self, bundle, ref):
         bundle = Path(bundle).absolute()
+        self.prepare(bundle, ref)
         with self.installation_lock():
             try:
                 self.recover()
@@ -1091,12 +1195,16 @@ def main(args=None):
     parser = argparse.ArgumentParser(description="Verified InstaBox Tool installer migration")
     parser.add_argument("--bundle", required=True)
     parser.add_argument("--ref", required=True)
+    parser.add_argument("--prepare-only", action="store_true", help="verify the bundle and prepare existing parent directories only")
     options = parser.parse_args(args)
     if os.geteuid() == 0:
         print("  [失败] 请使用普通用户，不要加 sudo。", file=sys.stderr)
         return 1
     try:
-        return Installer().install(options.bundle, options.ref)
+        installer = Installer()
+        if options.prepare_only:
+            return installer.prepare(options.bundle, options.ref)
+        return installer.install(options.bundle, options.ref)
     except KeyboardInterrupt:
         print("  [失败] 安装已中断；请重新运行同一命令检查恢复状态。", file=sys.stderr)
         return 130

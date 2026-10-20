@@ -1,5 +1,6 @@
 """Offline migration/rollback regressions; no cloud or real systemd operations."""
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -125,6 +126,186 @@ class MigrationTests(unittest.TestCase):
     def rehash_bundle(self):
         lines = [hashlib.sha256((self.bundle / name).read_bytes()).hexdigest() + "  " + name for name in migration.FILES]
         private_file(self.bundle / "SHA256SUMS", "\n".join(lines) + "\n")
+
+    def test_prepare_repairs_only_existing_parent_modes_and_preserves_other_data(self):
+        parents = [self.home / name for name in (".local", ".local/share", ".local/bin",
+                   ".config", ".config/systemd", ".config/systemd/user")]
+        for path in parents:
+            path.mkdir(mode=0o700, exist_ok=True)
+        unrelated = self.home / ".local/share/unrelated"
+        unrelated.mkdir(mode=0o700)
+        note = unrelated / "note.txt"
+        private_file(note, "unrelated user content\n", 0o666)
+        unrelated.chmod(0o777)
+        snapshot = (note.read_bytes(), note.stat().st_ino, stat.S_IMODE(note.stat().st_mode),
+                    unrelated.stat().st_ino, stat.S_IMODE(unrelated.stat().st_mode))
+        inodes = [path.stat().st_ino for path in parents]
+        for mode in (0o777, 0o775, 0o2775):
+            with self.subTest(mode=oct(mode)):
+                for path in parents:
+                    path.chmod(mode)
+                self.assertEqual(self.installer.prepare(self.bundle, REF), 0)
+                for path, inode in zip(parents, inodes):
+                    self.assertEqual(path.stat().st_ino, inode)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode & ~0o022)
+                self.assertEqual((note.read_bytes(), note.stat().st_ino, stat.S_IMODE(note.stat().st_mode),
+                                  unrelated.stat().st_ino, stat.S_IMODE(unrelated.stat().st_mode)), snapshot)
+        self.assertFalse(self.systemd.calls)
+        self.assertFalse(self.installer.app.exists())
+        self.assertFalse(self.installer.cfg.exists())
+        self.assertFalse(self.installer.work.exists())
+        self.assertFalse((self.home / ".bashrc").exists())
+        with mock.patch.object(migration.os, "fchmod", side_effect=AssertionError("already-safe directories were changed")):
+            self.assertEqual(self.installer.prepare(self.bundle, REF), 0)
+
+    def test_prepare_does_not_create_paths_before_authorization(self):
+        self.assertEqual(self.installer.prepare(self.bundle, REF), 0)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_install_repairs_parents_before_taking_the_installation_lock(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        self.assertEqual(self.installer.install(self.bundle, REF), 0)
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o755)
+        self.assertTrue((self.home / ".local/bin/ibt").is_file())
+
+    def test_prepare_rejects_invalid_bundle_before_changing_parent_permissions(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        private_file(self.bundle / "cloud.py", "changed bundle")
+        with self.assertRaises(migration.MigrationError), mock.patch.object(migration.os, "fchmod") as change:
+            self.installer.prepare(self.bundle, REF)
+        change.assert_not_called()
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o777)
+
+    def test_prepare_validates_all_parent_types_before_any_permission_change(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        config = self.home / ".config"
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        outside.chmod(0o777)
+        for kind in ("symlink", "file", "fifo"):
+            with self.subTest(kind=kind):
+                if kind == "symlink":
+                    config.symlink_to(outside, target_is_directory=True)
+                elif kind == "file":
+                    private_file(config, "not a directory\n")
+                else:
+                    os.mkfifo(config, 0o600)
+                try:
+                    with self.assertRaisesRegex(migration.MigrationError, r"\.config"), mock.patch.object(migration.os, "fchmod") as change:
+                        self.installer.prepare(self.bundle, REF)
+                    change.assert_not_called()
+                    self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o777)
+                    self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o777)
+                finally:
+                    config.unlink()
+
+    def test_prepare_rejects_foreign_owner_without_changing_any_directory(self):
+        local, config = self.home / ".local", self.home / ".config"
+        for path in (local, config):
+            path.mkdir(mode=0o700)
+            path.chmod(0o777)
+        actual_stat = os.stat
+
+        def foreign(path, *args, **kwargs):
+            info = actual_stat(path, *args, **kwargs)
+            if path == ".config" and kwargs.get("dir_fd") is not None:
+                fields = list(info)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return info
+
+        with mock.patch.object(migration.os, "stat", side_effect=foreign), mock.patch.object(migration.os, "fchmod") as change:
+            with self.assertRaisesRegex(migration.MigrationError, "不属于当前用户.*\\.config"):
+                self.installer.prepare(self.bundle, REF)
+        change.assert_not_called()
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o777)
+
+    def test_prepare_reports_read_only_denied_and_ineffective_permission_changes(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        cases = ((OSError(errno.EROFS, "fixture"), "只读"),
+                 (PermissionError(errno.EPERM, "fixture"), "不允许"),
+                 (PermissionError(errno.EACCES, "fixture"), "权限不足"),
+                 (None, "未生效"))
+        for effect, message in cases:
+            with self.subTest(message=message):
+                with mock.patch.object(migration.os, "fchmod", side_effect=effect):
+                    with self.assertRaisesRegex(migration.MigrationError, message) as error:
+                        self.installer.prepare(self.bundle, REF)
+                self.assertIn(".local", str(error.exception))
+                self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o777)
+                self.assertFalse(self.installer.app.exists())
+
+    def test_prepare_refuses_directory_replacement_between_validation_and_open(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        saved = self.home / "original-local"
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        outside.chmod(0o777)
+        actual_open = os.open
+
+        def replace_on_open(path, flags, *args, **kwargs):
+            if path == ".local" and kwargs.get("dir_fd") is not None:
+                local.rename(saved)
+                local.symlink_to(outside, target_is_directory=True)
+            return actual_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(migration.os, "open", side_effect=replace_on_open), mock.patch.object(migration.os, "fchmod") as change:
+            with self.assertRaisesRegex(migration.MigrationError, r"\.local"):
+                self.installer.prepare(self.bundle, REF)
+        change.assert_not_called()
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o777)
+
+    def test_prepare_rechecks_path_chains_after_each_change_without_unsafe_rollback(self):
+        local, config = self.home / ".local", self.home / ".config"
+        for path in (local, config):
+            path.mkdir(mode=0o700)
+            path.chmod(0o777)
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        outside.chmod(0o777)
+        saved = self.home / "original-config"
+        actual_chmod = os.fchmod
+
+        def replace_after_chmod(fd, mode):
+            actual_chmod(fd, mode)
+            config.rename(saved)
+            config.symlink_to(outside, target_is_directory=True)
+
+        with mock.patch.object(migration.os, "fchmod", side_effect=replace_after_chmod) as change:
+            with self.assertRaisesRegex(migration.MigrationError, "发生变化.*\\.config"):
+                self.installer.prepare(self.bundle, REF)
+        self.assertEqual(change.call_count, 1)
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o777)
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o777)
+
+    def test_prepare_keeps_home_and_owner_permissions_strict(self):
+        local = self.home / ".local"
+        local.mkdir(mode=0o700)
+        local.chmod(0o777)
+        self.home.chmod(0o777)
+        with self.assertRaises(migration.MigrationError), mock.patch.object(migration.os, "fchmod") as change:
+            self.installer.prepare(self.bundle, REF)
+        change.assert_not_called()
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o777)
+        self.home.chmod(0o700)
+        local.chmod(0o555)
+        with self.assertRaisesRegex(migration.MigrationError, "读写或进入权限"), mock.patch.object(migration.os, "fchmod") as change:
+            self.installer.prepare(self.bundle, REF)
+        change.assert_not_called()
+        self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o555)
 
     def legacy(self, *, cli_symlink=True, heartbeat_active=False):
         app, cfg = self.home / migration.OLD_APP, self.home / migration.OLD_CFG

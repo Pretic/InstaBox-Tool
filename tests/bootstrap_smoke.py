@@ -261,6 +261,35 @@ exec bash "$HOME/.local/share/insta-sing-box/cli/isb.sh" "$@"
     for directory in (menu_home, auto_fail_home, auto_fail_state, probe_fail_home, probe_fail_state):
         directory.mkdir(mode=0o700)
 
+    # InstaBox may precreate these ordinary user directories under a permissive
+    # umask. An empty HOME cannot exercise the real first-install failure.
+    permissive_cases = []
+    for parent_mode in (0o777, 0o775):
+        suffix = format(parent_mode, "04o")
+        parent_home, parent_state = TMP / ("parents-" + suffix + "-home"), TMP / ("parents-" + suffix + "-systemd")
+        parent_home.mkdir(mode=0o700)
+        parent_state.mkdir(mode=0o700)
+        parent_dirs = [parent_home / name for name in
+                       (".local", ".local/share", ".local/bin", ".config", ".config/systemd", ".config/systemd/user")]
+        for directory in parent_dirs:
+            directory.mkdir(exist_ok=True)
+            directory.chmod(parent_mode)
+        unrelated_dir = parent_home / ".local/share/unrelated-app"
+        private_file(unrelated_dir / "user-data.txt", "existing unrelated application data\n", 0o666)
+        unrelated_dir.chmod(0o777)
+        unrelated_command = parent_home / ".local/bin/unrelated-command"
+        private_file(unrelated_command, "#!/bin/sh\nexit 97\n", 0o777)
+        unrelated_config = parent_home / ".config/unrelated-app"
+        private_file(unrelated_config / "preferences.txt", "unrelated config remains unchanged\n", 0o666)
+        unrelated_config.chmod(0o777)
+        unrelated_snapshot = {
+            path: (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode), path.read_bytes() if path.is_file() else None)
+            for path in (unrelated_dir, unrelated_dir / "user-data.txt", unrelated_command,
+                         unrelated_config, unrelated_config / "preferences.txt")
+        }
+        permissive_cases.append((parent_home, parent_state, parent_mode,
+                                 {path: path.stat().st_ino for path in parent_dirs}, unrelated_snapshot))
+
     # Exercise the actual full installer with a new HOME. Only the two external
     # release payloads and their pinned digests, a controlled connection probe,
     # and the auto-local side effect differ in this bundle.
@@ -594,6 +623,75 @@ if [[ "$file" == "${CORRUPT_FILE:-}" ]]; then echo BAD >> "$out"; fi
     assert (fresh_home / "api-actions").read_text().splitlines() == api_after_install
     assert (fresh_home / "auto-actions").read_text().splitlines() == ["auto-local"], "updating reconfigured automatic keepalive"
 
+    for parent_home, parent_state, parent_mode, parent_inodes, unrelated_snapshot in permissive_cases:
+        label = "parent mode " + format(parent_mode, "04o")
+        parent_env = {**authorized, "FRESH_SYSTEMD_STATE": str(parent_state)}
+        assert not (parent_home / ".local/share/insta-box").exists(), label + ": fixture is not a first installation"
+        result = setup({**parent_env, "INSTABOX_API_KEY": bad_key}, home=parent_home,
+                       mode="install", bundle_source=fresh_source)
+        assert result.returncode != 0, label + ": permission repair bypassed API authorization"
+        assert not (parent_home / ".local/share/insta-box").exists()
+        assert not (parent_home / ".config/insta-box").exists()
+        assert not (parent_home / "auto-actions").exists() and not list(parent_state.iterdir())
+        # Preparation precedes authorization so a Key is never first saved
+        # beneath writable common directories. Rejection still installs no
+        # CLI, node, credential, or service; unrelated contents stay unchanged.
+        for path, inode in parent_inodes.items():
+            assert path.stat().st_ino == inode
+            assert stat.S_IMODE(path.stat().st_mode) == parent_mode & ~0o022, label + ": preparation did not repair " + str(path.relative_to(parent_home)) + " before authorization"
+        for path, snapshot in unrelated_snapshot.items():
+            assert (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode), path.read_bytes() if path.is_file() else None) == snapshot
+        for path in parent_inodes:
+            path.chmod(parent_mode)
+
+        api_before = (parent_home / "api-actions").read_text().splitlines()
+        result = setup(parent_env, home=parent_home, mode="install", bundle_source=fresh_source)
+        assert result.returncode == 0, label + ": " + result.stderr + result.stdout
+        assert authorized["INSTABOX_API_KEY"] not in result.stdout + result.stderr
+        assert (parent_home / "api-actions").read_text().splitlines()[len(api_before):] == ["GET /v1/me", "GET /v1/machines"] * 2
+        assert (parent_home / "auto-actions").read_text().splitlines() == ["auto-local"]
+        parent_app, parent_cfg = parent_home / ".local/share/insta-box", parent_home / ".config/insta-box"
+        assert (parent_app / "cli/ibt.sh").is_file()
+        assert (parent_app / "state.conf").is_file() and (parent_app / "config.json").is_file()
+        assert (parent_cfg / "api-key").read_text() == authorized["INSTABOX_API_KEY"] + "\n"
+        assert stat.S_IMODE(parent_cfg.stat().st_mode) == 0o700
+        assert stat.S_IMODE((parent_cfg / "api-key").stat().st_mode) == 0o600
+        assert "Registered tunnel connection" in (parent_app / "quick.log").read_text()
+        assert stat.S_IMODE((parent_app / "quick.log").stat().st_mode) == 0o600
+        assert (parent_state / "insta-box-node.service").exists() and (parent_state / "insta-box-quick.service").exists()
+        for path, inode in parent_inodes.items():
+            assert path.stat().st_ino == inode, label + ": parent directory was replaced"
+            # The existing node installer makes the service directory private
+            # when it installs units. Preparation itself, checked above, only
+            # removes group/other write bits from every common parent.
+            expected_mode = 0o700 if path == parent_home / ".config/systemd/user" else parent_mode & ~0o022
+            assert stat.S_IMODE(path.stat().st_mode) == expected_mode, label + ": " + str(path.relative_to(parent_home)) + " has mode " + format(stat.S_IMODE(path.stat().st_mode), "04o")
+        for path, snapshot in unrelated_snapshot.items():
+            observed = (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode), path.read_bytes() if path.is_file() else None)
+            assert observed == snapshot, label + ": permission repair recursed into unrelated data"
+
+        # An existing installation must accept the same narrow repair without
+        # reauthorizing, recreating its node or rerunning automatic setup.
+        preserved_paths = [parent_app / name for name in ("state.conf", "config.json", "quick.log")]
+        preserved_paths.append(parent_cfg / "api-key")
+        parent_snapshot = {path: (path.read_bytes(), path.stat().st_ino, stat.S_IMODE(path.stat().st_mode)) for path in preserved_paths}
+        previous_release = (parent_app / "cli").resolve()
+        previous_api = (parent_home / "api-actions").read_bytes()
+        for path in parent_inodes:
+            path.chmod(parent_mode)
+        result = setup({**parent_env, "API_FIXTURE_MODE": "forbid", "INSTABOX_API_KEY": bad_key},
+                       home=parent_home, bundle_source=fresh_source)
+        assert result.returncode == 0, label + " update: " + result.stderr + result.stdout
+        assert (parent_app / "cli").resolve() != previous_release
+        assert (parent_home / "api-actions").read_bytes() == previous_api
+        assert (parent_home / "auto-actions").read_text().splitlines() == ["auto-local"]
+        for path, snapshot in parent_snapshot.items():
+            assert (path.read_bytes(), path.stat().st_ino, stat.S_IMODE(path.stat().st_mode)) == snapshot, label + ": updating changed node or private state"
+        for path, inode in parent_inodes.items():
+            assert path.stat().st_ino == inode and stat.S_IMODE(path.stat().st_mode) == parent_mode & ~0o022
+        for path, snapshot in unrelated_snapshot.items():
+            assert (path.stat().st_ino, stat.S_IMODE(path.stat().st_mode), path.read_bytes() if path.is_file() else None) == snapshot
+
     # A partial installation is useful for retrying: keep the already-created
     # node and private Key, but report failure until auto-local is enabled.
     result = setup({**authorized, "FRESH_SYSTEMD_STATE": str(auto_fail_state), "FRESH_AUTO_RC": "1"},
@@ -617,6 +715,6 @@ if [[ "$file" == "${CORRUPT_FILE:-}" ]]; then echo BAD >> "$out"; fi
     assert (probe_fail_home / ".config/insta-box/api-key").read_text() == authorized["INSTABOX_API_KEY"] + "\n"
     assert (probe_fail_home / "auto-actions").read_text().splitlines() == ["auto-local"], "failed Quick connection skipped automatic keepalive"
     assert (probe_fail_state / "insta-box-quick.service").exists()
-    print("Non-root legacy SDK/SSH-only migration, repeat upgrades without reauthorization, first-install API gate before side effects, private Key persistence, Quick setup, probe/auto-local failure propagation, login PATH, and corruption rejection: passed")
+    print("Non-root legacy SDK/SSH-only migration, repeat upgrades without reauthorization, first-install API gate before node/service changes, 0777/0775 parent repair without recursive changes, private Key persistence, Quick setup, probe/auto-local failure propagation, login PATH, and corruption rejection: passed")
 finally:
     shutil.rmtree(TMP, ignore_errors=True)

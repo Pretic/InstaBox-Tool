@@ -185,6 +185,7 @@ BBR 设置检查内核支持，写入 `/etc/sysctl.d/90-insta-box-tool-bbr.conf`
 | 现象 | 处理方法 |
 | --- | --- |
 | 提示找不到 `ibt` | 执行 `export PATH="$HOME/.local/bin:$PATH"`，或直接运行 `~/.local/bin/ibt` |
+| 安装提示 `~/.local` 等父目录权限不安全 | 重新运行最新的一键安装命令；安装器会自动收紧当前用户拥有的安装父目录写权限。若仍失败，按提示检查具体路径的所有者、符号链接或只读挂载；不要使用 `chmod -R 777` 或 `sudo` 安装 |
 | 粘贴密钥后没有字符 | 隐藏输入属于正常显示；粘贴后按回车 |
 | 重启后 Quick 链接失效 | 运行 `ibt show`，重新导入当前链接 |
 | Quick 尚无地址或连接失败 | 查看 `ibt logs quick` 和 `ibt diagnose`；需要时重建或切换 HTTP/2 |
