@@ -1,6 +1,6 @@
 # InstaBox Tool
 
-**版本：0.0.1**
+**版本：0.0.1** · [MIT License](LICENSE)
 
 在 InstaBox 上一键安装 **sing-box + Cloudflare Quick Tunnel**，自动配置本机保活。安装后输入 `ibt`，通过中文菜单管理节点、云端机器和系统设置。
 
@@ -100,6 +100,10 @@ ssh -p 2222 ibssh_...@api.instabox.sh
 - **节点连接异常**时运行 `ibt diagnose`；需要重新创建临时隧道时运行 `ibt refresh-quick`，随后重新导入当前链接。
 - **API Key 和节点链接请勿公开。** 隐藏输入框中粘贴后按回车即可。
 - **保活需要控制端持续运行。** 它通过后台定时任务执行；控制端已暂停时，需要从控制台恢复。机制与状态说明见[保活说明](docs/keepalive.md)。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE)。使用、修改或分发时，请保留许可证中的版权声明及许可声明。sing-box、cloudflared 等第三方组件遵循各自的许可证。
 
 ## 感谢
 
