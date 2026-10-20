@@ -1,0 +1,24 @@
+# Runtime secrets and node profiles never belong in the public repository.
+api-key
+*.token
+*.key
+.env*
+state.conf
+config.json
+machine.json
+keepalive-state.json
+heartbeat.json
+heartbeat-state.json
+heartbeat.lock
+heartbeat_known_hosts*
+.heartbeat*
+cloud-operation*.json
+cloud-request*.json
+cloud-requests/
+cf-backups/
+node_modules/
+*.log
+*.tar.gz
+*.zip
+__pycache__/
+.DS_Store

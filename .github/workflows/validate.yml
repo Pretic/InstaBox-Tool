@@ -1,0 +1,47 @@
+name: Validate manager and SDK contract
+on:
+  push:
+    paths: ['*.sh', '*.mjs', '*.py', 'SHA256SUMS', 'tests/**', '.github/workflows/validate.yml']
+  pull_request:
+    paths: ['*.sh', '*.mjs', '*.py', 'SHA256SUMS', 'tests/**', '.github/workflows/validate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify source bundle and syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c SHA256SUMS
+          for f in setup.sh ibt.sh install.sh keepalive.sh; do bash -n "$f"; done
+          node --check platform.mjs
+          node --check tests/sdk-contract.mjs
+          python3 -m py_compile cf_route.py cf_select.py heartbeat.py cloud.py ssh_tokens.py machine_opt.py node_probe.py system_info.py ui_time.py migrate.py tests/terminal_smoke.py tests/bootstrap_smoke.py tests/test_onboarding.py tests/test_heartbeat.py tests/test_cloud.py tests/test_ssh_tokens.py tests/test_fleet.py tests/test_migration.py tests/test_machine_opt.py tests/test_node_probe.py tests/test_quick.py tests/test_system_info.py tests/test_ui_time.py tests/test_cf_select.py tests/test_cf_dependencies.py tests/test_cf_route.py
+          bash ibt.sh --version
+          bash ibt.sh help >/dev/null
+      - name: Platform policy regression
+        run: node --test tests/platform.test.mjs
+      - name: Fleet management, API heartbeat, SSH credentials, and lifecycle regression
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Terminal and credential regression
+        run: python3 tests/terminal_smoke.py
+      - name: Existing installation migration and integrity regression
+        run: python3 tests/bootstrap_smoke.py
+      - name: Published SDK wire contract (no account or network calls to InstaBox)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ver in 0.2.0 0.5.3; do
+            sdk_dir=$(mktemp -d "$RUNNER_TEMP/ibt-sdk.XXXXXX")
+            npm install --prefix "$sdk_dir" --ignore-scripts --no-audit --no-fund --no-save --silent "@insforge/instabox-sdk@$ver"
+            echo "SDK $ver"
+            SDK_ENTRY="$sdk_dir/node_modules/@insforge/instabox-sdk/dist/index.js" node tests/sdk-contract.mjs
+          done
